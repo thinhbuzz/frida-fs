@@ -165,7 +165,7 @@ class WriteStream extends stream.Writable {
     #writeRequest: Promise<void> | null = null;
 
     constructor(path: string, { flags } = {
-        flags: constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC
+        flags: constants.O_WRONLY | constants.O_CREAT | constants.O_APPEND,
     }) {
         super({
             highWaterMark: 4 * 1024 * 1024
