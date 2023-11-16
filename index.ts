@@ -3,12 +3,10 @@ import fsPath from "path";
 import process from "process";
 import stream from "stream";
 
-const getWindowsApi = memoize(_getWindowsApi);
 const getPosixApi = memoize(_getPosixApi);
 
 const platform = Process.platform;
 const pointerSize = Process.pointerSize;
-const isWindows = platform === "windows";
 
 const S_IFMT = 0xf000;
 const S_IFREG = 0x8000;
@@ -55,22 +53,6 @@ const universalConstants: ApiConstants = {
     DT_WHT: 14,
 };
 const platformConstants: Partial<Record<Platform, ApiConstants>> = {
-    darwin: {
-        O_RDONLY: 0x0,
-        O_WRONLY: 0x1,
-        O_RDWR: 0x2,
-        O_CREAT: 0x200,
-        O_EXCL: 0x800,
-        O_NOCTTY: 0x20000,
-        O_TRUNC: 0x400,
-        O_APPEND: 0x8,
-        O_DIRECTORY: 0x100000,
-        O_NOFOLLOW: 0x100,
-        O_SYNC: 0x80,
-        O_DSYNC: 0x400000,
-        O_SYMLINK: 0x200000,
-        O_NONBLOCK: 0x4,
-    },
     linux: {
         O_RDONLY: 0x0,
         O_WRONLY: 0x1,
@@ -133,43 +115,19 @@ class ReadStream extends stream.Readable {
         super({
             highWaterMark: 4 * 1024 * 1024
         });
+        const api = getPosixApi();
 
-        if (isWindows) {
-            const api = getWindowsApi();
+        const result = api.open(Memory.allocUtf8String(path), constants.O_RDONLY, 0);
 
-            const result = api.CreateFileW(
-                Memory.allocUtf16String(path),
-                GENERIC_READ,
-                FILE_SHARE_READ,
-                NULL,
-                OPEN_EXISTING,
-                FILE_FLAG_OVERLAPPED,
-                NULL);
-
-            const handle = result.value;
-            if (handle.equals(INVALID_HANDLE_VALUE)) {
-                process.nextTick(() => {
-                    this.destroy(makeWindowsError(result.lastError));
-                });
-                return;
-            }
-
-            this.#input = new Win32InputStream(handle, { autoClose: true });
-        } else {
-            const api = getPosixApi();
-
-            const result = api.open(Memory.allocUtf8String(path), constants.O_RDONLY, 0);
-
-            const fd = result.value;
-            if (fd === -1) {
-                process.nextTick(() => {
-                    this.destroy(makePosixError(result.errno));
-                });
-                return;
-            }
-
-            this.#input = new UnixInputStream(fd, { autoClose: true });
+        const fd = result.value;
+        if (fd === -1) {
+            process.nextTick(() => {
+                this.destroy(makePosixError(result.errno));
+            });
+            return;
         }
+
+        this.#input = new UnixInputStream(fd, { autoClose: true });
     }
 
     _destroy(error: Error | null, callback: (error?: Error | null) => void): void {
@@ -206,50 +164,27 @@ class WriteStream extends stream.Writable {
     #output: OutputStream | null = null;
     #writeRequest: Promise<void> | null = null;
 
-    constructor(path: string) {
+    constructor(path: string, { flags } = {
+        flags: constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC
+    }) {
         super({
             highWaterMark: 4 * 1024 * 1024
         });
+        const api = getPosixApi();
 
-        if (isWindows) {
-            const api = getWindowsApi();
+        const pathStr = Memory.allocUtf8String(path);
+        const mode = constants.S_IRUSR | constants.S_IWUSR | constants.S_IRGRP | constants.S_IROTH;
+        const result = api.open(pathStr, flags, mode);
 
-            const result = api.CreateFileW(
-                Memory.allocUtf16String(path),
-                GENERIC_WRITE,
-                0,
-                NULL,
-                CREATE_ALWAYS,
-                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
-                NULL);
-
-            const handle = result.value;
-            if (handle.equals(INVALID_HANDLE_VALUE)) {
-                process.nextTick(() => {
-                    this.destroy(makeWindowsError(result.lastError));
-                });
-                return;
-            }
-
-            this.#output = new Win32OutputStream(handle, { autoClose: true });
-        } else {
-            const api = getPosixApi();
-
-            const pathStr = Memory.allocUtf8String(path);
-            const flags = constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC;
-            const mode = constants.S_IRUSR | constants.S_IWUSR | constants.S_IRGRP | constants.S_IROTH;
-            const result = api.open(pathStr, flags, mode);
-
-            const fd = result.value;
-            if (fd === -1) {
-                process.nextTick(() => {
-                    this.destroy(makePosixError(result.errno));
-                });
-                return;
-            }
-
-            this.#output = new UnixOutputStream(fd, { autoClose: true });
+        const fd = result.value;
+        if (fd === -1) {
+            process.nextTick(() => {
+                this.destroy(makePosixError(result.errno));
+            });
+            return;
         }
+
+        this.#output = new UnixOutputStream(fd, { autoClose: true });
     }
 
     _destroy(error: Error | null, callback: (error?: Error | null) => void): void {
@@ -285,150 +220,6 @@ interface PlatformBackend {
     unlinkSync(path: string): void;
     statSync(path: string): Stats;
     lstatSync(path: string): Stats;
-}
-
-const windowsBackend: PlatformBackend = {
-    enumerateDirectoryEntries(path: string, callback: (entry: NativePointer) => void): void {
-        enumerateWindowsDirectoryEntriesMatching(path + "\\*", callback);
-    },
-
-    readFileSync(path: string, options: ReadFileOptions = {}): string | Buffer {
-        if (typeof options === "string")
-            options = { encoding: options };
-        const { encoding = null } = options;
-
-        const { CreateFileW, GetFileSizeEx, ReadFile, CloseHandle } = getWindowsApi();
-
-        const createRes = CreateFileW(
-            Memory.allocUtf16String(path),
-            GENERIC_READ,
-            FILE_SHARE_READ,
-            NULL,
-            OPEN_EXISTING,
-            0,
-            NULL);
-        const handle = createRes.value;
-        if (handle.equals(INVALID_HANDLE_VALUE))
-            throwWindowsError(createRes.lastError);
-
-        try {
-            const scratchBuf = Memory.alloc(8);
-
-            const fileSizeBuf = scratchBuf;
-            const getRes = GetFileSizeEx(handle, fileSizeBuf);
-            if (getRes.value === 0)
-                throwWindowsError(getRes.lastError);
-            const fileSize = fileSizeBuf.readU64().valueOf();
-
-            const buf = Memory.alloc(fileSize);
-
-            const numBytesReadBuf = scratchBuf;
-            const readRes = ReadFile(handle, buf, fileSize, numBytesReadBuf, NULL);
-            if (readRes.value === 0)
-                throwWindowsError(readRes.lastError);
-            const n = numBytesReadBuf.readU32();
-
-            if (n !== fileSize)
-                throw new Error("Short read");
-
-            return parseReadFileResult(buf, fileSize, encoding);
-        } finally {
-            CloseHandle(handle);
-        }
-    },
-
-    readlinkSync(path: string): string {
-        const { CreateFileW, GetFinalPathNameByHandleW, CloseHandle } = getWindowsApi();
-
-        const createRes = CreateFileW(
-            Memory.allocUtf16String(path),
-            0,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            NULL,
-            OPEN_EXISTING,
-            FILE_FLAG_BACKUP_SEMANTICS,
-            NULL);
-        const handle = createRes.value;
-        if (handle.equals(INVALID_HANDLE_VALUE))
-            throwWindowsError(createRes.lastError);
-
-        try {
-            let maxLength = 256;
-            while (true) {
-                const buf = Memory.alloc(maxLength * 2);
-
-                const { value, lastError } = GetFinalPathNameByHandleW(handle, buf, maxLength, 0);
-                if (value === 0)
-                    throwWindowsError(lastError);
-                if (lastError === ERROR_NOT_ENOUGH_MEMORY) {
-                    maxLength *= 2;
-                    continue;
-                }
-
-                return buf.readUtf16String()!.substring(4);
-            }
-        } finally {
-            CloseHandle(handle);
-        }
-    },
-
-    rmdirSync(path: string): void {
-        const result = getWindowsApi().RemoveDirectoryW(Memory.allocUtf16String(path));
-        if (result.value === 0)
-            throwWindowsError(result.lastError);
-    },
-
-    unlinkSync(path: string): void {
-        const result = getWindowsApi().DeleteFileW(Memory.allocUtf16String(path));
-        if (result.value === 0)
-            throwWindowsError(result.lastError);
-    },
-
-    statSync(path: string): Stats {
-        const s = windowsBackend.lstatSync(path);
-        if (!s.isSymbolicLink())
-            return s;
-
-        const target = windowsBackend.readlinkSync(path);
-        return windowsBackend.lstatSync(target);
-    },
-
-    lstatSync(path: string): Stats {
-        const getFileExInfoStandard = 0;
-        const buf = Memory.alloc(36);
-        const result = getWindowsApi().GetFileAttributesExW(Memory.allocUtf16String(path), getFileExInfoStandard, buf);
-        if (result.value === 0) {
-            if (result.lastError === ERROR_SHARING_VIOLATION) {
-                let fileAttrData: NativePointer;
-                enumerateWindowsDirectoryEntriesMatching(path, data => {
-                    // WIN32_FIND_DATAW starts with the exact same fields as WIN32_FILE_ATTRIBUTE_DATA
-                    fileAttrData = Memory.dup(data, 36);
-                });
-                return makeStatsProxy(path, fileAttrData!);
-            }
-            throwWindowsError(result.lastError);
-        }
-        return makeStatsProxy(path, buf);
-    },
-};
-
-function enumerateWindowsDirectoryEntriesMatching(filename: string, callback: (entry: NativePointer) => void): void {
-    const { FindFirstFileW, FindNextFileW, FindClose } = getWindowsApi();
-
-    const data = Memory.alloc(592);
-
-    const result = FindFirstFileW(Memory.allocUtf16String(filename), data);
-    const handle = result.value;
-    if (handle.equals(INVALID_HANDLE_VALUE))
-        throwWindowsError(result.lastError);
-
-    try {
-        do {
-            callback(data);
-        } while (FindNextFileW(handle, data) !== 0);
-    } finally {
-        FindClose(handle);
-    }
 }
 
 const posixBackend: PlatformBackend = {
@@ -576,7 +367,7 @@ function encodingIsUtf8(encoding: string | null): boolean {
     return encoding === "utf8" || encoding === "utf-8";
 }
 
-const backend: PlatformBackend = isWindows ? windowsBackend : posixBackend;
+const backend: PlatformBackend = posixBackend;
 
 const {
     enumerateDirectoryEntries,
@@ -606,14 +397,6 @@ type DirentFieldSpec<T> = [
 ];
 
 const direntSpecs: { [abi: string]: DirentSpec; } = {
-    "windows": {
-        "d_name": [44, "Utf16String"],
-        "d_type": [0, readWindowsFileAttributes],
-        "atime": [12, readWindowsFileTime],
-        "mtime": [20, readWindowsFileTime],
-        "ctime": [4, readWindowsFileTime],
-        "size": [28, readWindowsFileSize],
-    },
     "linux-32": {
         "d_name": [11, "Utf8String"],
         "d_type": [10, "U8"]
@@ -621,18 +404,10 @@ const direntSpecs: { [abi: string]: DirentSpec; } = {
     "linux-64": {
         "d_name": [19, "Utf8String"],
         "d_type": [18, "U8"]
-    },
-    "darwin-32": {
-        "d_name": [21, "Utf8String"],
-        "d_type": [20, "U8"]
-    },
-    "darwin-64": {
-        "d_name": [21, "Utf8String"],
-        "d_type": [20, "U8"]
     }
 };
 
-const direntSpec = isWindows ? direntSpecs.windows : direntSpecs[`${platform}-${pointerSize * 8}`];
+const direntSpec = direntSpecs[`${platform}-${pointerSize * 8}`];
 
 function readdirSync(path: string): string[] {
     const entries: string[] = [];
@@ -754,63 +529,6 @@ const statSpecGenericLinux32: StatSpec = {
     }
 };
 const statSpecs: { [abi: string]: StatSpec; } = {
-    "windows": {
-        size: 36,
-        fields: {
-            "dev": [0, returnZero],
-            "mode": [0, readWindowsFileAttributes],
-            "nlink": [0, returnOne],
-            "ino": [0, returnZero],
-            "uid": [0, returnZero],
-            "gid": [0, returnZero],
-            "rdev": [0, returnZero],
-            "atime": [12, readWindowsFileTime],
-            "mtime": [20, readWindowsFileTime],
-            "ctime": [20, readWindowsFileTime],
-            "birthtime": [4, readWindowsFileTime],
-            "size": [28, readWindowsFileSize],
-            "blocks": [28, readWindowsFileSize],
-            "blksize": [0, returnOne],
-        },
-    },
-    "darwin-32": {
-        size: 108,
-        fields: {
-            "dev": [0, "S32"],
-            "mode": [4, "U16"],
-            "nlink": [6, "U16"],
-            "ino": [8, "U64"],
-            "uid": [16, "U32"],
-            "gid": [20, "U32"],
-            "rdev": [24, "S32"],
-            "atime": [28, readTimespec32],
-            "mtime": [36, readTimespec32],
-            "ctime": [44, readTimespec32],
-            "birthtime": [52, readTimespec32],
-            "size": [60, "S64"],
-            "blocks": [68, "S64"],
-            "blksize": [76, "S32"],
-        }
-    },
-    "darwin-64": {
-        size: 144,
-        fields: {
-            "dev": [0, "S32"],
-            "mode": [4, "U16"],
-            "nlink": [6, "U16"],
-            "ino": [8, "U64"],
-            "uid": [16, "U32"],
-            "gid": [20, "U32"],
-            "rdev": [24, "S32"],
-            "atime": [32, readTimespec64],
-            "mtime": [48, readTimespec64],
-            "ctime": [64, readTimespec64],
-            "birthtime": [80, readTimespec64],
-            "size": [96, "S64"],
-            "blocks": [104, "S64"],
-            "blksize": [112, "S32"],
-        }
-    },
     "linux-ia32": statSpecGenericLinux32,
     "linux-ia32-stat64": {
         size: 96,
@@ -901,30 +619,20 @@ function getStatSpec(): StatSpec {
     if (cachedStatSpec !== null)
         return cachedStatSpec;
 
-    let statSpec;
-    if (isWindows) {
-        statSpec = statSpecs.windows;
-    } else {
-        const api = getPosixApi();
-        const stat64Impl = api.stat64 ?? api.__xstat64;
+    const api = getPosixApi();
+    const stat64Impl = api.stat64 ?? api.__xstat64;
 
-        let platformId: string;
-        if (platform === "darwin") {
-            platformId = `darwin-${pointerSize * 8}`;
-        } else {
-            platformId = `${platform}-${Process.arch}`;
-            if (pointerSize === 4 && stat64Impl !== undefined) {
-                platformId += "-stat64";
-            }
-        }
-
-        statSpec = statSpecs[platformId];
-        if (statSpec === undefined)
-            throw new Error("Current OS/arch combo is not yet supported; please open a PR");
-
-        statSpec._stat = stat64Impl ?? api.stat;
-        statSpec._lstat = api.lstat64 ?? api.__lxstat64 ?? api.lstat;
+    let platformId: string = `${platform}-${Process.arch}`;
+    if (pointerSize === 4 && stat64Impl !== undefined) {
+        platformId += "-stat64";
     }
+
+    let statSpec = statSpecs[platformId];
+    if (statSpec === undefined)
+        throw new Error("Current OS/arch combo is not yet supported; please open a PR");
+
+    statSpec._stat = stat64Impl ?? api.stat;
+    statSpec._lstat = api.lstat64 ?? api.__lxstat64 ?? api.lstat;
 
     cachedStatSpec = statSpec;
 
@@ -1054,49 +762,6 @@ function statsReadField<T>(this: Stats, name: string, path: string): number | UI
     return value;
 }
 
-function readWindowsFileAttributes(this: NativePointer, path?: string): number {
-    const attributes = this.readU32();
-
-    let isLink = false;
-    if ((attributes & FILE_ATTRIBUTE_REPARSE_POINT) !== 0) {
-        enumerateWindowsDirectoryEntriesMatching(path!, data => {
-            const reserved0 = data.add(36).readU32();
-            isLink = (reserved0 === IO_REPARSE_TAG_MOUNT_POINT || reserved0 === IO_REPARSE_TAG_SYMLINK);
-        });
-    }
-
-    const isDir = (attributes & FILE_ATTRIBUTE_DIRECTORY) !== 0;
-
-    let mode;
-    if (isLink)
-        mode = S_IFLNK;
-    else if (isDir)
-        mode = S_IFDIR;
-    else
-        mode = S_IFREG;
-
-    if (isDir)
-        mode |= 0x1ed;
-    else
-        mode |= 0x1a4;
-
-    return mode;
-}
-
-function readWindowsFileTime(this: NativePointer): Date {
-    const fileTime = BigInt(this.readU64().toString()).valueOf();
-    const ticksPerMsec = 10000n;
-    const msecToUnixEpoch = 11644473600000n;
-    const unixTime = (fileTime / ticksPerMsec) - msecToUnixEpoch;
-    return new Date(parseInt(unixTime.toString()));
-}
-
-function readWindowsFileSize(this: NativePointer): UInt64 {
-    const high = this.readU32();
-    const low = this.add(4).readU32();
-    return uint64(high).shl(32).or(low);
-}
-
 function readTimespec32(this: NativePointer): Date {
     const sec = this.readU32();
     const nsec = this.add(4).readU32();
@@ -1120,25 +785,8 @@ function returnOne(): number {
     return 1;
 }
 
-function throwWindowsError(lastError: number): never {
-    throw makeWindowsError(lastError);
-}
-
 function throwPosixError(errno: number): never {
     throw makePosixError(errno);
-}
-
-function makeWindowsError(lastError: number): Error {
-    const maxLength = 256;
-
-    const FORMAT_MESSAGE_FROM_SYSTEM = 0x00001000;
-    const FORMAT_MESSAGE_IGNORE_INSERTS = 0x00000200;
-
-    const buf = Memory.alloc(maxLength * 2);
-    getWindowsApi().FormatMessageW(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
-        NULL, lastError, 0, buf, maxLength, NULL);
-
-    return new Error(buf.readUtf16String()!);
 }
 
 function makePosixError(errno: number): Error {
@@ -1172,48 +820,7 @@ function callbackify<
 
 const ssizeType = (pointerSize === 8) ? "int64" : "int32";
 const sizeType = "u" + ssizeType;
-const offsetType = (platform === "darwin" || pointerSize === 8) ? "int64" : "int32";
-
-interface WindowsApi {
-    CreateFileW(fileName: NativePointerValue, desiredAccess: number, shareMode: number, securityAttributes: NativePointerValue,
-        creationDisposition: number, flagsAndAttributes: number, templateFile: NativePointerValue)
-        : WindowsSystemFunctionResult<NativePointer>;
-    DeleteFileW(fileName: NativePointerValue): WindowsSystemFunctionResult<number>;
-    GetFileSizeEx(file: NativePointerValue, fileSize: NativePointerValue): WindowsSystemFunctionResult<number>;
-    ReadFile(file: NativePointerValue, buffer: NativePointerValue, numberOfBytesToRead: number, numberOfBytesRead: NativePointerValue,
-        overlapped: NativePointerValue): WindowsSystemFunctionResult<number>;
-    RemoveDirectoryW(pathName: NativePointerValue): WindowsSystemFunctionResult<number>;
-    CloseHandle(object: NativePointerValue): number;
-    FindFirstFileW(fileName: NativePointerValue, findFileData: NativePointerValue): WindowsSystemFunctionResult<NativePointer>;
-    FindNextFileW(findFile: NativePointerValue, findFileData: NativePointerValue): number;
-    FindClose(findFile: NativePointerValue): number;
-    GetFileAttributesExW(fileName: NativePointerValue, infoLevelId: number, fileInformation: NativePointerValue)
-        : WindowsSystemFunctionResult<number>;
-    GetFinalPathNameByHandleW(file: NativePointerValue, filePathBuf: NativePointerValue, filePathLen: number, flags: number)
-        : WindowsSystemFunctionResult<number>;
-    FormatMessageW(flags: number, source: NativePointerValue, messageId: number, languageId: number, buffer: NativePointerValue,
-        size: number, args: NativePointerValue): number;
-}
-
-function _getWindowsApi(): WindowsApi {
-    const SF = SystemFunction;
-    const NF = NativeFunction;
-
-    return makeApi<WindowsApi>([
-        ["CreateFileW", SF, "pointer", ["pointer", "uint", "uint", "pointer", "uint", "uint", "pointer"]],
-        ["DeleteFileW", SF, "uint", ["pointer"]],
-        ["GetFileSizeEx", SF, "uint", ["pointer", "pointer"]],
-        ["ReadFile", SF, "uint", ["pointer", "pointer", "uint", "pointer", "pointer"]],
-        ["RemoveDirectoryW", SF, "uint", ["pointer"]],
-        ["CloseHandle", NF, "uint", ["pointer"]],
-        ["FindFirstFileW", SF, "pointer", ["pointer", "pointer"]],
-        ["FindNextFileW", NF, "uint", ["pointer", "pointer"]],
-        ["FindClose", NF, "uint", ["pointer"]],
-        ["GetFileAttributesExW", SF, "uint", ["pointer", "uint", "pointer"]],
-        ["GetFinalPathNameByHandleW", SF, "uint", ["pointer", "pointer", "uint", "uint"]],
-        ["FormatMessageW", NF, "uint", ["uint", "pointer", "uint", "uint", "pointer", "uint", "pointer"]],
-    ]);
-}
+const offsetType = pointerSize === 8 ? "int64" : "int32";
 
 interface PosixApi {
     open(path: NativePointerValue, oflag: number, mode: number): UnixSystemFunctionResult<number>;
@@ -1291,7 +898,7 @@ function makeApi<T>(spec: ApiSpec): T {
     }, {} as T);
 }
 
-const nativeOpts: NativeFunctionOptions = (isWindows && pointerSize === 4) ? { abi: "stdcall" } : {};
+const nativeOpts: NativeFunctionOptions = {};
 
 function addApiPlaceholder<T>(api: T, entry: ApiSpecEntry): void {
     const [name] = entry;
@@ -1301,9 +908,7 @@ function addApiPlaceholder<T>(api: T, entry: ApiSpecEntry): void {
             const [, Ctor, retType, argTypes, wrapper] = entry;
 
             let impl = null;
-            const address = isWindows
-                ? Module.findExportByName("kernel32.dll", name)
-                : Module.findExportByName(null, name);
+            const address = Module.findExportByName(null, name);
             if (address !== null)
                 impl = new Ctor(address, retType, argTypes, nativeOpts);
 
