@@ -164,15 +164,14 @@ class WriteStream extends stream.Writable {
     #output: OutputStream | null = null;
     #writeRequest: Promise<void> | null = null;
 
-    constructor(path: string, { flags } = {
-        flags: constants.O_WRONLY | constants.O_CREAT | constants.O_APPEND,
-    }) {
+    constructor(path: string) {
         super({
             highWaterMark: 4 * 1024 * 1024
         });
         const api = getPosixApi();
 
         const pathStr = Memory.allocUtf8String(path);
+        const flags = constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC;
         const mode = constants.S_IRUSR | constants.S_IWUSR | constants.S_IRGRP | constants.S_IROTH;
         const result = api.open(pathStr, flags, mode);
 
