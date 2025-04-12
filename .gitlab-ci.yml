@@ -1,0 +1,22 @@
+stages:
+  - build
+
+build:
+  image: thinhbuzz/pnpm:9.15.4
+  cache:
+    key:
+      files:
+        - pnpm-lock.yaml
+    paths:
+      - .pnpm-store
+  stage: build
+  script:
+    - pnpm install --frozen-lockfile
+    - pnpm link --global
+  artifacts:
+    paths:
+      - dist/
+    expire_in: 1 week
+  only:
+    - master
+
